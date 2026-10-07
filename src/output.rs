@@ -1,0 +1,164 @@
+//! Render packed pages and write PDF / CBZ / image folders.
+
+use crate::layout::OutPage;
+use anyhow::{Context, Result};
+use image::{DynamicImage, ImageReader, Rgb, RgbImage, imageops, imageops::FilterType};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug)]
+pub struct RenderOptions {
+    pub width: u32,
+    pub height: u32,
+    pub color: bool,
+    pub gamma: f32,
+    pub quality: u8,
+}
+
+pub fn load_image(path: &Path) -> Result<DynamicImage> {
+    ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()
+        .with_context(|| format!("decoding {}", path.display()))
+}
+
+/// Compose one Kindle page and return it JPEG-encoded.
+pub fn render_page(page: &OutPage, sources: &[PathBuf], o: &RenderOptions) -> Result<Vec<u8>> {
+    let mut canvas = RgbImage::from_pixel(o.width, o.height, Rgb([255, 255, 255]));
+    let mut cache: HashMap<usize, DynamicImage> = HashMap::new();
+    for it in &page.items {
+        if !cache.contains_key(&it.page) {
+            cache.insert(it.page, load_image(&sources[it.page])?);
+        }
+        let img = &cache[&it.page];
+        let crop = img.crop_imm(it.src.x, it.src.y, it.src.w, it.src.h);
+        let (rw, rh) = if it.rotated { (it.h, it.w) } else { (it.w, it.h) };
+        let mut tile = crop.resize_exact(rw, rh, FilterType::Lanczos3).to_rgb8();
+        if it.rotated {
+            tile = imageops::rotate90(&tile);
+        }
+        imageops::overlay(&mut canvas, &tile, it.x as i64, it.y as i64);
+    }
+
+    if (o.gamma - 1.0).abs() > f32::EPSILON {
+        let lut: Vec<u8> = (0..256)
+            .map(|v| ((v as f32 / 255.0).powf(o.gamma) * 255.0).round() as u8)
+            .collect();
+        for p in canvas.pixels_mut() {
+            p.0 = p.0.map(|c| lut[c as usize]);
+        }
+    }
+
+    let mut buf = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, o.quality);
+    if o.color {
+        enc.encode_image(&canvas)?;
+    } else {
+        enc.encode_image(&DynamicImage::ImageRgb8(canvas).to_luma8())?;
+    }
+    Ok(buf)
+}
+
+/// Minimal PDF: one full-bleed JPEG per page, page size matching the screen at its ppi.
+pub fn write_pdf(path: &Path, pages: &[Vec<u8>], o: &RenderOptions, ppi: u32, title: &str) -> Result<()> {
+    let mut w = Counter { inner: BufWriter::new(fs::File::create(path)?), pos: 0 };
+    let mut offsets: Vec<u64> = Vec::new();
+    let pw = o.width as f32 * 72.0 / ppi as f32;
+    let ph = o.height as f32 * 72.0 / ppi as f32;
+    let cs = if o.color { "DeviceRGB" } else { "DeviceGray" };
+    let n = pages.len();
+    // Object ids: 1 catalog, 2 pages, 3 info, then (page, contents, image) per page.
+    let page_id = |i: usize| 4 + 3 * i;
+
+    w.write_all(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")?;
+    offsets.push(w.pos);
+    write!(w, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")?;
+    offsets.push(w.pos);
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", page_id(i))).collect();
+    write!(w, "2 0 obj\n<< /Type /Pages /Count {n} /Kids [{}] >>\nendobj\n", kids.join(" "))?;
+    offsets.push(w.pos);
+    write!(w, "3 0 obj\n<< /Title ({}) /Producer (comic-kindle) >>\nendobj\n", pdf_escape(title))?;
+
+    for (i, jpeg) in pages.iter().enumerate() {
+        let id = page_id(i);
+        offsets.push(w.pos);
+        write!(
+            w,
+            "{id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw:.2} {ph:.2}] \
+             /Resources << /XObject << /Im0 {} 0 R >> >> /Contents {} 0 R >>\nendobj\n",
+            id + 2,
+            id + 1
+        )?;
+        let content = format!("q {pw:.2} 0 0 {ph:.2} 0 0 cm /Im0 Do Q");
+        offsets.push(w.pos);
+        write!(w, "{} 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n", id + 1, content.len())?;
+        offsets.push(w.pos);
+        write!(
+            w,
+            "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{cs} \
+             /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n",
+            id + 2,
+            o.width,
+            o.height,
+            jpeg.len()
+        )?;
+        w.write_all(jpeg)?;
+        w.write_all(b"\nendstream\nendobj\n")?;
+    }
+
+    let xref = w.pos;
+    write!(w, "xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1)?;
+    for off in &offsets {
+        write!(w, "{off:010} 00000 n \n")?;
+    }
+    write!(w, "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{xref}\n%%EOF\n", offsets.len() + 1)?;
+    w.inner.flush()?;
+    Ok(())
+}
+
+fn pdf_escape(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .flat_map(|c| match c {
+            '(' | ')' | '\\' => vec!['\\', c],
+            _ => vec![c],
+        })
+        .collect()
+}
+
+struct Counter<W: Write> {
+    inner: W,
+    pos: u64,
+}
+
+impl<W: Write> Write for Counter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub fn write_cbz(path: &Path, pages: &[Vec<u8>]) -> Result<()> {
+    let mut zip = zip::ZipWriter::new(fs::File::create(path)?);
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (i, jpeg) in pages.iter().enumerate() {
+        zip.start_file(format!("{:05}.jpg", i + 1), opts)?;
+        zip.write_all(jpeg)?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
+pub fn write_images(dir: &Path, pages: &[Vec<u8>]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    for (i, jpeg) in pages.iter().enumerate() {
+        fs::write(dir.join(format!("{:05}.jpg", i + 1)), jpeg)?;
+    }
+    Ok(())
+}
