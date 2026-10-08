@@ -7,6 +7,7 @@ description = "Detect comic panels and repack them into Kindle-sized pages reada
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+flate2 = "1.1.10"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "rayon"] }
 indicatif = { version = "0.18.6", features = ["rayon"] }
 rayon = "1.12.0"

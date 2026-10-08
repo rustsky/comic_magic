@@ -2,6 +2,7 @@ mod detect;
 mod devices;
 mod input;
 mod layout;
+mod ocr;
 mod output;
 mod progress;
 
@@ -72,6 +73,15 @@ struct Args {
     /// By default slanted or irregular panels are cut along their exact outline.
     #[arg(long)]
     rect_crop: bool,
+
+    /// Language of the comic's text, e.g. en, fr, de, es, ja, fa (or a Tesseract code).
+    /// Asked interactively together with the Kindle model; defaults to English.
+    #[arg(short, long)]
+    lang: Option<String>,
+
+    /// Don't add the invisible OCR text layer used for dictionary lookup.
+    #[arg(long)]
+    no_ocr: bool,
 
     /// Rotate wide panels to landscape when that makes them notably larger.
     #[arg(long)]
@@ -158,6 +168,27 @@ fn run() -> Result<()> {
     };
     let color = device.color || args.color;
     println!("Target: {} ({}x{} @ {} ppi)", device.name, device.width, device.height, device.ppi);
+    let prompted = args.device.is_none() && args.width.is_none();
+    let lang = match &args.lang {
+        Some(l) => l.clone(),
+        None if prompted && !args.no_ocr && args.format == Format::Pdf => ocr::prompt()?,
+        None => "en".into(),
+    };
+    // OCR text layer: PDF only, and only when Tesseract has the language.
+    let ocr_lang = if args.no_ocr || args.format != Format::Pdf {
+        None
+    } else {
+        match ocr::resolve(&lang) {
+            Ok((code, name)) => {
+                println!("Text layer: {name} (dictionary lookup enabled)");
+                Some(code)
+            }
+            Err(e) => {
+                eprintln!("warning: {e:#}; continuing without a text layer");
+                None
+            }
+        }
+    };
 
     let start = Instant::now();
     let tmp = tempfile::tempdir()?;
@@ -178,26 +209,47 @@ fn run() -> Result<()> {
     if let Some(d) = &args.debug_dir {
         std::fs::create_dir_all(d)?;
     }
-    let pb = progress::bar("Detecting", pages.len(), "pages");
-    let detected: Vec<(layout::SourcePage, Vec<Option<detect::Shape>>)> = pages
+    let pb = progress::bar("Detecting", pages.len(), if ocr_lang.is_some() { "pages (panels + text)" } else { "pages" });
+    struct Analysed {
+        source: layout::SourcePage,
+        shapes: Vec<Option<detect::Shape>>,
+        words: Vec<ocr::Word>,
+    }
+    let analysed: Vec<Analysed> = pages
         .par_iter()
         .enumerate()
         .progress_with(pb.clone())
-        .map(|(i, p)| -> Result<(layout::SourcePage, Vec<Option<detect::Shape>>)> {
+        .map(|(i, p)| -> Result<Analysed> {
             let img = output::load_image(p)?;
             let panels = detect::detect_panels(&img, &det);
             if let Some(d) = &args.debug_dir {
                 detect::debug_image(&img, &panels).save(d.join(format!("page{:04}.jpg", i + 1)))?;
             }
+            let words = match &ocr_lang {
+                Some(lang) => ocr::recognize(&img, lang).with_context(|| format!("OCR of {}", p.display()))?,
+                None => Vec::new(),
+            };
             let rects = panels.iter().map(|p| p.rect).collect();
             let shapes = panels.into_iter().map(|p| p.shape).collect();
-            Ok((layout::SourcePage { height: img.height(), panels: rects }, shapes))
+            Ok(Analysed { source: layout::SourcePage { height: img.height(), panels: rects }, shapes, words })
         })
         .collect::<Result<_>>()?;
     pb.finish_and_clear();
-    let (sources, shapes): (Vec<_>, Vec<_>) = detected.into_iter().unzip();
+    let mut sources = Vec::new();
+    let mut shapes = Vec::new();
+    let mut words = Vec::new();
+    for a in analysed {
+        sources.push(a.source);
+        shapes.push(a.shapes);
+        words.push(a.words);
+    }
     let n_panels: usize = sources.iter().map(|s| s.panels.len()).sum();
-    println!("Detected {n_panels} panel(s)");
+    if ocr_lang.is_some() {
+        let n_words: usize = words.iter().map(Vec::len).sum();
+        println!("Detected {n_panels} panel(s), recognised {n_words} word(s)");
+    } else {
+        println!("Detected {n_panels} panel(s)");
+    }
 
     // 2. Pack panels into Kindle pages.
     let lo = layout::LayoutOptions {
@@ -235,7 +287,10 @@ fn run() -> Result<()> {
     let title = input.file_stem().and_then(|s| s.to_str()).unwrap_or("comic");
     let pb = progress::spinner("Writing", &out_path.display().to_string());
     match args.format {
-        Format::Pdf => output::write_pdf(&out_path, &rendered, &ro, device.ppi, title)?,
+        Format::Pdf => {
+            let texts: Vec<_> = out_pages.iter().map(|p| ocr::place_words(p, &words, &shapes)).collect();
+            output::write_pdf(&out_path, &rendered, &texts, &ro, device.ppi, title)?
+        }
         Format::Cbz => output::write_cbz(&out_path, &rendered)?,
         Format::Images => output::write_images(&out_path, &rendered)?,
     }

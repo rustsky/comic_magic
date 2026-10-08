@@ -17,14 +17,17 @@ cargo build --release
 
 PDF input needs `mutool` (MuPDF) or `pdftoppm` (Poppler) on PATH (`brew install mupdf`).
 CBR/CB7 input uses `bsdtar` (built into macOS), `unar` or `7z`.
+The dictionary text layer needs Tesseract (`brew install tesseract`). English is included; for
+other languages, run `brew install tesseract-lang`.
 
 ## Use
 
 ```sh
-comic-magic mycomic.cbz                       # asks which Kindle you have
+comic-magic mycomic.cbz                       # asks which Kindle you have and the comic's language
 comic-magic mycomic.pdf -d paperwhite-5       # -> mycomic_paperwhite-5.pdf
 comic-magic pages/ -d kindle-11 -f cbz        # folder of images -> CBZ
-comic-magic manga.cbz -d oasis --rtl --print-height 7.2
+comic-magic manga.cbz -d oasis --rtl --print-height 7.2 --lang ja
+comic-magic bd.cbz -d paperwhite-5 --lang fr       # French text layer
 comic-magic --list-devices
 comic-magic in.cbz --width 1072 --height 1448 --ppi 300   # custom screen
 ```
@@ -51,7 +54,14 @@ size of the screen.
    size. The tool works this out from the device ppi and `--print-height`. Panels from the same
    row stay side by side when they fit. Otherwise they are stacked. Each Kindle page is filled
    with as many panels as fit, and then scaled up to use any leftover space.
-4. **Output**: grayscale JPEG pages (colour on Colorsoft or with `--color`), saved as PDF, CBZ or
+4. **Text layer** (PDF only): each page is OCR'd with Tesseract, and every recognised word is
+   placed as invisible text exactly over its lettering, following the panel's crop, scale and
+   rotation. Long-pressing a word on the Kindle then selects it for dictionary lookup,
+   highlighting and search. ALL-CAPS lettering is stored in lowercase, and words hyphenated
+   across lines are joined, so lookups find dictionary entries. The language is set with
+   `--lang` (default `en`), and `--no-ocr` turns this off. OCR adds about 1 s per page per
+   CPU core. Sound effects and stylised lettering are mostly not recognised.
+5. **Output**: grayscale JPEG pages (colour on Colorsoft or with `--color`), saved as PDF, CBZ or
    an image folder.
 
 ## Tuning
@@ -64,5 +74,6 @@ size of the screen.
 | Panels merged together | `--split-coverage 0.5`, `--threshold 30` |
 | Panels split too much | `--split-coverage 0.2` |
 | Washed-out e-ink | `--gamma 1.4` |
+| Dictionary lookup missing words | check `--lang`; copy the PDF over USB (Send to Kindle can drop the text layer) |
 | Neighbouring panels cut into an L-shaped panel | `--rect-crop` |
 | Check detection | `--debug-dir dbg/` writes each page with the detected panel outlines, numbered in reading order |
