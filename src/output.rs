@@ -1,5 +1,6 @@
 //! Render packed pages and write PDF / CBZ / image folders.
 
+use crate::detect::Shape;
 use crate::layout::OutPage;
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageReader, Rgb, RgbImage, imageops, imageops::FilterType};
@@ -25,7 +26,13 @@ pub fn load_image(path: &Path) -> Result<DynamicImage> {
 }
 
 /// Compose one Kindle page and return it JPEG-encoded.
-pub fn render_page(page: &OutPage, sources: &[PathBuf], o: &RenderOptions) -> Result<Vec<u8>> {
+/// `shapes[page][panel]` is the exact outline of a non-rectangular panel.
+pub fn render_page(
+    page: &OutPage,
+    sources: &[PathBuf],
+    shapes: &[Vec<Option<Shape>>],
+    o: &RenderOptions,
+) -> Result<Vec<u8>> {
     let mut canvas = RgbImage::from_pixel(o.width, o.height, Rgb([255, 255, 255]));
     let mut cache: HashMap<usize, DynamicImage> = HashMap::new();
     for it in &page.items {
@@ -36,6 +43,16 @@ pub fn render_page(page: &OutPage, sources: &[PathBuf], o: &RenderOptions) -> Re
         let crop = img.crop_imm(it.src.x, it.src.y, it.src.w, it.src.h);
         let (rw, rh) = if it.rotated { (it.h, it.w) } else { (it.w, it.h) };
         let mut tile = crop.resize_exact(rw, rh, FilterType::Lanczos3).to_rgb8();
+        if let Some(shape) = &shapes[it.page][it.panel] {
+            // Paint everything outside the panel's outline white.
+            let (sx, sy) = (it.src.w as f32 / rw as f32, it.src.h as f32 / rh as f32);
+            for (x, y, p) in tile.enumerate_pixels_mut() {
+                let a = shape.alpha(it.src.x as f32 + (x as f32 + 0.5) * sx, it.src.y as f32 + (y as f32 + 0.5) * sy);
+                if a < 1.0 {
+                    p.0 = p.0.map(|c| (c as f32 * a + 255.0 * (1.0 - a)).round() as u8);
+                }
+            }
+        }
         if it.rotated {
             tile = imageops::rotate90(&tile);
         }

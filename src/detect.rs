@@ -12,6 +12,9 @@
 //!    crosses it, so each candidate is split recursively along low-coverage lines.
 //! 5. Panels are put in reading order with an XY-cut over the boxes: rows top to
 //!    bottom, then left to right (right to left for manga).
+//!
+//! Each panel keeps its blob as a [`Shape`] so non-rectangular panels can be cut
+//! out exactly instead of as a bounding box.
 
 use image::{DynamicImage, GrayImage, imageops::FilterType};
 
@@ -50,6 +53,8 @@ pub struct DetectOptions {
     pub min_panel_area: f32,
     /// Padding added around each panel, as a fraction of the shorter page side.
     pub padding: f32,
+    /// Keep the outline of non-rectangular panels so they can be cut out exactly.
+    pub exact_shapes: bool,
     pub rtl: bool,
 }
 
@@ -58,6 +63,74 @@ const DETECT_MAX: u32 = 1200;
 /// Erosion radius (analysis pixels) used to break thin bridges between panels.
 const ERODE: usize = 3;
 const MAX_DEPTH: u32 = 12;
+
+/// A panel together with its exact outline when it isn't a plain rectangle.
+#[derive(Clone, Debug)]
+pub struct Panel {
+    pub rect: Rect,
+    pub shape: Option<Shape>,
+}
+
+/// Panel outline: a bit mask at analysis resolution placed in page coordinates.
+#[derive(Clone, Debug)]
+pub struct Shape {
+    /// Page coordinates of the mask's top-left corner.
+    ox: f32,
+    oy: f32,
+    /// Page pixels per mask pixel.
+    sx: f32,
+    sy: f32,
+    w: usize,
+    h: usize,
+    bits: Vec<u64>,
+}
+
+impl Shape {
+    fn from_mask(m: &Mask, ox: f32, oy: f32, sx: f32, sy: f32) -> Shape {
+        let mut bits = vec![0u64; (m.w * m.h).div_ceil(64)];
+        for (i, _) in m.data.iter().enumerate().filter(|(_, b)| **b) {
+            bits[i / 64] |= 1 << (i % 64);
+        }
+        Shape { ox, oy, sx, sy, w: m.w, h: m.h, bits }
+    }
+
+    fn get(&self, x: isize, y: isize) -> bool {
+        if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
+            return false;
+        }
+        let i = y as usize * self.w + x as usize;
+        self.bits[i / 64] >> (i % 64) & 1 == 1
+    }
+
+    /// How much of the page pixel at (`px`, `py`) belongs to the panel, 0..=1.
+    /// Bilinear over the mask, then steepened so edges stay crisp but anti-aliased.
+    pub fn alpha(&self, px: f32, py: f32) -> f32 {
+        let mx = (px - self.ox) / self.sx - 0.5;
+        let my = (py - self.oy) / self.sy - 0.5;
+        let (x0, y0) = (mx.floor(), my.floor());
+        let (tx, ty) = (mx - x0, my - y0);
+        let (x0, y0) = (x0 as isize, y0 as isize);
+        let v = |x, y| self.get(x, y) as u8 as f32;
+        let top = v(x0, y0) * (1.0 - tx) + v(x0 + 1, y0) * tx;
+        let bot = v(x0, y0 + 1) * (1.0 - tx) + v(x0 + 1, y0 + 1) * tx;
+        let a = top * (1.0 - ty) + bot * ty;
+        ((a - 0.5) * 2.0 + 0.5).clamp(0.0, 1.0)
+    }
+
+    /// Mask pixels on the outline, as page-coordinate rectangles.
+    fn outline(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
+        (0..self.h as isize).flat_map(move |y| {
+            (0..self.w as isize).filter_map(move |x| {
+                let edge = self.get(x, y)
+                    && !(self.get(x - 1, y) && self.get(x + 1, y) && self.get(x, y - 1) && self.get(x, y + 1));
+                edge.then(|| (self.ox + x as f32 * self.sx, self.oy + y as f32 * self.sy))
+            })
+        })
+    }
+}
+
+/// A shape that fills this much of its bounding box is treated as a rectangle.
+const RECT_FILL: f32 = 0.97;
 
 #[derive(Clone)]
 struct Mask {
@@ -96,6 +169,49 @@ impl Mask {
         cols
     }
 
+    /// Replace the mask with its convex hull. Panels are almost always convex, and the
+    /// hull also closes white balloons that break through the panel border into the
+    /// gutter, which would otherwise read as holes. L-shaped panels get their notch filled.
+    fn convex_fill(&self) -> Mask {
+        // Pixel-corner points of each row's extent are enough to build the hull.
+        let mut pts: Vec<(i64, i64)> = Vec::new();
+        for y in 0..self.h {
+            let line = &self.data[y * self.w..(y + 1) * self.w];
+            if let (Some(a), Some(b)) = (line.iter().position(|&v| v), line.iter().rposition(|&v| v)) {
+                let (y, a, b) = (y as i64, a as i64, b as i64 + 1);
+                pts.extend([(a, y), (b, y), (a, y + 1), (b, y + 1)]);
+            }
+        }
+        let hull = convex_hull(pts);
+        let mut out = Mask::new(self.w, self.h);
+        if hull.len() < 3 {
+            return self.clone();
+        }
+        // Scanline fill at pixel centres.
+        for y in 0..self.h {
+            let cy = y as f64 + 0.5;
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for i in 0..hull.len() {
+                let (x0, y0) = (hull[i].0 as f64, hull[i].1 as f64);
+                let (x1, y1) = (hull[(i + 1) % hull.len()].0 as f64, hull[(i + 1) % hull.len()].1 as f64);
+                if (y0 <= cy && cy <= y1) || (y1 <= cy && cy <= y0) {
+                    let x = if y1 == y0 { x0.min(x1) } else { x0 + (cy - y0) * (x1 - x0) / (y1 - y0) };
+                    let x_hi = if y1 == y0 { x0.max(x1) } else { x };
+                    lo = lo.min(x);
+                    hi = hi.max(x_hi);
+                }
+            }
+            if lo < hi {
+                let a = (lo - 0.5).ceil().max(0.0) as usize;
+                let b = ((hi - 0.5).floor() as i64).min(self.w as i64 - 1);
+                if b >= a as i64 {
+                    out.data[y * self.w + a..=y * self.w + b as usize].fill(true);
+                }
+            }
+        }
+        out
+    }
+
     /// Square-kernel dilation (`erode = false`) or erosion (`erode = true`) of radius `r`.
     /// Separable, using running counts. Outside the mask counts as set when eroding.
     fn morph(&self, r: usize, erode: bool) -> Mask {
@@ -120,9 +236,9 @@ impl Mask {
     }
 }
 
-pub fn detect_panels(img: &DynamicImage, o: &DetectOptions) -> Vec<Rect> {
+pub fn detect_panels(img: &DynamicImage, o: &DetectOptions) -> Vec<Panel> {
     let (ow, oh) = (img.width(), img.height());
-    let full = Rect { x: 0, y: 0, w: ow, h: oh };
+    let full = Panel { rect: Rect { x: 0, y: 0, w: ow, h: oh }, shape: None };
     if ow < 32 || oh < 32 {
         return vec![full];
     }
@@ -181,29 +297,67 @@ pub fn detect_panels(img: &DynamicImage, o: &DetectOptions) -> Vec<Rect> {
         let local = Rect { x: 0, y: 0, w: own.w as u32, h: own.h as u32 };
         let min_seg = ((w as f32 * 0.08) as usize, (h as f32 * 0.06) as usize);
         split(&own, local, o.split_coverage, min_seg, 0, &mut parts);
-        panels.extend(parts.into_iter().map(|r| Rect { x: r.x + x0 as u32, y: r.y + y0 as u32, ..r }));
+        for r in parts {
+            // The piece's own pixels, grown by one pixel so the panel border line survives.
+            let mut m = Mask::new(r.w as usize, r.h as usize);
+            for y in 0..m.h {
+                for x in 0..m.w {
+                    m.data[y * m.w + x] = own.at(r.x as usize + x, r.y as usize + y);
+                }
+            }
+            let m = m.morph(1, false).convex_fill();
+            panels.push((Rect { x: r.x + x0 as u32, y: r.y + y0 as u32, ..r }, m));
+        }
     }
 
     let min_area = (page_area * o.min_panel_area) as u64;
-    panels.retain(|r| r.area() >= min_area && r.w as f32 >= 0.03 * w as f32 && r.h as f32 >= 0.03 * h as f32);
+    panels.retain(|(r, _)| r.area() >= min_area && r.w as f32 >= 0.03 * w as f32 && r.h as f32 >= 0.03 * h as f32);
     // Drop boxes that sit mostly inside a bigger one (insets, stray balloons).
-    let all = panels.clone();
-    panels.retain(|a| !all.iter().any(|b| b.area() > a.area() && a.overlap_area(b) * 10 >= a.area() * 8));
-    let panels = reading_order(panels, o.rtl);
+    let all: Vec<Rect> = panels.iter().map(|(r, _)| *r).collect();
+    panels.retain(|(a, _)| !all.iter().any(|b| b.area() > a.area() && a.overlap_area(b) * 10 >= a.area() * 8));
+    let panels = reading_order(panels, |(r, _)| *r, o.rtl);
 
     let pad = (ow.min(oh) as f32 * o.padding).round() as i64;
-    let panels: Vec<Rect> = panels
+    let panels: Vec<Panel> = panels
         .iter()
-        .map(|r| {
+        .map(|(r, m)| {
             let x0 = ((r.x as f32 * fx).floor() as i64 - pad).max(0);
             let y0 = ((r.y as f32 * fy).floor() as i64 - pad).max(0);
             let x1 = ((r.right() as f32 * fx).ceil() as i64 + pad).min(ow as i64);
             let y1 = ((r.bottom() as f32 * fy).ceil() as i64 + pad).min(oh as i64);
-            Rect { x: x0 as u32, y: y0 as u32, w: (x1 - x0) as u32, h: (y1 - y0) as u32 }
+            let rect = Rect { x: x0 as u32, y: y0 as u32, w: (x1 - x0) as u32, h: (y1 - y0) as u32 };
+            let fill = m.data.iter().filter(|&&b| b).count() as f32 / m.data.len().max(1) as f32;
+            let shape = (o.exact_shapes && fill < RECT_FILL)
+                .then(|| Shape::from_mask(m, r.x as f32 * fx, r.y as f32 * fy, fx, fy));
+            Panel { rect, shape }
         })
         .collect();
 
     if panels.is_empty() { vec![full] } else { panels }
+}
+
+/// Andrew's monotone chain; returns hull vertices in order.
+fn convex_hull(mut pts: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    pts.sort_unstable();
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: (i64, i64), a: (i64, i64), b: (i64, i64)| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
+    let mut hull: Vec<(i64, i64)> = Vec::with_capacity(pts.len() * 2);
+    for pass in 0..2 {
+        let start = hull.len();
+        let iter: Box<dyn Iterator<Item = &(i64, i64)>> =
+            if pass == 0 { Box::new(pts.iter()) } else { Box::new(pts.iter().rev()) };
+        for &p in iter {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0 {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
 }
 
 /// Median luma of a thin band around the page edge: the paper / gutter colour.
@@ -372,18 +526,21 @@ fn segments(profile: &[usize], limit: usize, min_len: usize) -> Vec<(usize, usiz
 
 /// XY-cut over boxes: split into horizontal bands where no box straddles the cut
 /// (allowing 15% overlap for slanted panels), else into columns, recursively.
-fn reading_order(boxes: Vec<Rect>, rtl: bool) -> Vec<Rect> {
+fn reading_order<T: Clone>(boxes: Vec<T>, rect: fn(&T) -> Rect, rtl: bool) -> Vec<T> {
     if boxes.len() <= 1 {
         return boxes;
     }
     for horizontal in [true, false] {
-        let span = |b: &Rect| if horizontal { (b.y, b.bottom()) } else { (b.x, b.right()) };
+        let span = |t: &T| {
+            let b = rect(t);
+            if horizontal { (b.y, b.bottom()) } else { (b.x, b.right()) }
+        };
         let mut sorted = boxes.clone();
         sorted.sort_by_key(|b| {
             let (lo, hi) = span(b);
             lo + hi
         });
-        let mut groups: Vec<Vec<Rect>> = Vec::new();
+        let mut groups: Vec<Vec<T>> = Vec::new();
         let mut end = 0;
         for b in sorted {
             let (lo, hi) = span(&b);
@@ -403,42 +560,92 @@ fn reading_order(boxes: Vec<Rect>, rtl: bool) -> Vec<Rect> {
             if !horizontal && rtl {
                 groups.reverse();
             }
-            return groups.into_iter().flat_map(|g| reading_order(g, rtl)).collect();
+            return groups.into_iter().flat_map(|g| reading_order(g, rect, rtl)).collect();
         }
     }
     let mut boxes = boxes;
-    boxes.sort_by_key(|b| (b.y, b.x));
+    boxes.sort_by_key(|t| (rect(t).y, rect(t).x));
     boxes
 }
 
-/// Draw detected panels on a copy of the page, numbered by reading order.
-pub fn debug_image(img: &DynamicImage, panels: &[Rect]) -> image::RgbImage {
+/// Draw detected panels on a copy of the page: exact outlines and numbered badges in reading order.
+pub fn debug_image(img: &DynamicImage, panels: &[Panel]) -> image::RgbImage {
     let mut out = img.to_rgb8();
     let (w, h) = out.dimensions();
-    let t = (w.min(h) / 300).max(2);
-    let colors = [[230, 25, 75], [60, 180, 75], [0, 130, 200], [245, 130, 48], [145, 30, 180]];
-    for (i, r) in panels.iter().enumerate() {
-        let c = image::Rgb(colors[i % colors.len()]);
-        for y in r.y..r.bottom().min(h) {
-            for x in r.x..(r.x + r.w).min(w) {
-                let edge = x < r.x + t || x + t >= r.x + r.w || y < r.y + t || y + t >= r.bottom();
-                if edge {
-                    out.put_pixel(x, y, c);
+    let t = (w.min(h) / 250).max(2);
+    let colors = [[230, 57, 70], [29, 120, 214], [46, 160, 67], [240, 140, 0], [142, 68, 173]];
+    let fill = |out: &mut image::RgbImage, x0: f32, y0: f32, x1: f32, y1: f32, c: [u8; 3]| {
+        let (x0, y0) = (x0.max(0.0) as u32, y0.max(0.0) as u32);
+        for y in y0..(y1.max(0.0) as u32).min(h) {
+            for x in x0..(x1.max(0.0) as u32).min(w) {
+                out.put_pixel(x, y, image::Rgb(c));
+            }
+        }
+    };
+    for (i, p) in panels.iter().enumerate() {
+        let c = colors[i % colors.len()];
+        let r = p.rect;
+        let t = t as f32;
+        match &p.shape {
+            Some(s) => {
+                let half = (t - s.sx.max(s.sy)).max(0.0) / 2.0;
+                for (x, y) in s.outline() {
+                    fill(&mut out, x - half, y - half, x + s.sx + half, y + s.sy + half, c);
+                }
+            }
+            None => {
+                let (x0, y0, x1, y1) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, r.bottom() as f32);
+                fill(&mut out, x0, y0, x1, y0 + t, c);
+                fill(&mut out, x0, y1 - t, x1, y1, c);
+                fill(&mut out, x0, y0, x0 + t, y1, c);
+                fill(&mut out, x1 - t, y0, x1, y1, c);
+            }
+        }
+        // Numbered badge in the top-left corner.
+        let radius = (w.min(h) as f32 / 38.0).max(12.0);
+        let (cx, cy) = (r.x as f32 + radius * 1.4, r.y as f32 + radius * 1.4);
+        for y in (cy - radius - 3.0) as u32..((cy + radius + 3.0) as u32).min(h) {
+            for x in (cx - radius - 3.0).max(0.0) as u32..((cx + radius + 3.0) as u32).min(w) {
+                let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                if d <= radius {
+                    out.put_pixel(x, y, image::Rgb(c));
+                } else if d <= radius + 3.0 {
+                    out.put_pixel(x, y, image::Rgb([255, 255, 255]));
                 }
             }
         }
-        // Index marker: i+1 small squares in the top-left corner.
-        let s = t * 4;
-        for k in 0..=i as u32 {
-            let bx = r.x + t * 2 + k * (s + t);
-            for y in r.y + t * 2..(r.y + t * 2 + s).min(h) {
-                for x in bx..(bx + s).min(w) {
-                    out.put_pixel(x, y, c);
+        draw_number(&mut out, i + 1, cx, cy, (radius / 4.5).max(2.0));
+    }
+    out
+}
+
+/// Draw `n` centred at (`cx`, `cy`) in white with a 3x5 pixel font scaled by `k`.
+fn draw_number(img: &mut image::RgbImage, n: usize, cx: f32, cy: f32, k: f32) {
+    const DIGITS: [[u8; 5]; 10] = [
+        [7, 5, 5, 5, 7], [2, 6, 2, 2, 7], [7, 1, 7, 4, 7], [7, 1, 7, 1, 7], [5, 5, 7, 1, 1],
+        [7, 4, 7, 1, 7], [7, 4, 7, 5, 7], [7, 1, 1, 1, 1], [7, 5, 7, 5, 7], [7, 5, 7, 1, 7],
+    ];
+    let text = n.to_string();
+    let total_w = (text.len() as f32 * 4.0 - 1.0) * k;
+    let (x0, y0) = (cx - total_w / 2.0, cy - 2.5 * k);
+    let (w, h) = img.dimensions();
+    for (di, ch) in text.bytes().enumerate() {
+        let glyph = DIGITS[(ch - b'0') as usize];
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..3 {
+                if bits >> (2 - col) & 1 == 0 {
+                    continue;
+                }
+                let px = x0 + (di as f32 * 4.0 + col as f32) * k;
+                let py = y0 + row as f32 * k;
+                for y in py.max(0.0) as u32..((py + k) as u32).min(h) {
+                    for x in px.max(0.0) as u32..((px + k) as u32).min(w) {
+                        img.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                    }
                 }
             }
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -466,8 +673,29 @@ mod tests {
             split_coverage: 0.35,
             min_panel_area: 0.01,
             padding: 0.0,
+            exact_shapes: true,
             rtl,
         }
+    }
+
+    #[test]
+    fn convex_fill_closes_open_holes_and_keeps_slant() {
+        // A slanted panel (wider at the bottom) with a balloon-shaped gap open at the top.
+        let rows = [
+            "0011100000",
+            "0011100110",
+            "0111100111",
+            "0111111111",
+            "1111111111",
+        ];
+        let m = Mask {
+            w: 10,
+            h: 5,
+            data: rows.iter().flat_map(|r| r.bytes().map(|b| b == b'1')).collect(),
+        };
+        let f = m.convex_fill();
+        assert!(f.at(6, 1) && f.at(5, 0), "open gap inside the outline is filled");
+        assert!(!f.at(0, 0) && !f.at(0, 1), "area outside the slanted edge stays out");
     }
 
     #[test]
@@ -481,9 +709,10 @@ mod tests {
             (520, 950, 430, 230),
             (520, 1220, 430, 230),
         ]);
-        let expect = |p: Vec<Rect>, want: &[(u32, u32)]| {
+        let expect = |p: Vec<Panel>, want: &[(u32, u32)]| {
             assert_eq!(p.len(), want.len(), "{p:?}");
-            for (r, &(x, y)) in p.iter().zip(want) {
+            assert!(p.iter().all(|p| p.shape.is_none()), "rectangles need no shape mask");
+            for (r, &(x, y)) in p.iter().map(|p| p.rect).zip(want) {
                 assert!(r.x.abs_diff(x) <= 4 && r.y.abs_diff(y) <= 4, "{r:?} vs {:?}", (x, y));
             }
         };

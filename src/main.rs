@@ -68,6 +68,11 @@ struct Args {
     #[arg(long, default_value_t = 10.1875)]
     print_height: f32,
 
+    /// Crop every panel to its bounding box, even when it isn't rectangular.
+    /// By default slanted or irregular panels are cut along their exact outline.
+    #[arg(long)]
+    rect_crop: bool,
+
     /// Rotate wide panels to landscape when that makes them notably larger.
     #[arg(long)]
     rotate: bool,
@@ -167,26 +172,30 @@ fn run() -> Result<()> {
         split_coverage: args.split_coverage,
         min_panel_area: args.min_panel_area,
         padding: 0.004,
+        exact_shapes: !args.rect_crop,
         rtl: args.rtl,
     };
     if let Some(d) = &args.debug_dir {
         std::fs::create_dir_all(d)?;
     }
     let pb = progress::bar("Detecting", pages.len(), "pages");
-    let sources: Vec<layout::SourcePage> = pages
+    let detected: Vec<(layout::SourcePage, Vec<Option<detect::Shape>>)> = pages
         .par_iter()
         .enumerate()
         .progress_with(pb.clone())
-        .map(|(i, p)| -> Result<layout::SourcePage> {
+        .map(|(i, p)| -> Result<(layout::SourcePage, Vec<Option<detect::Shape>>)> {
             let img = output::load_image(p)?;
             let panels = detect::detect_panels(&img, &det);
             if let Some(d) = &args.debug_dir {
                 detect::debug_image(&img, &panels).save(d.join(format!("page{:04}.jpg", i + 1)))?;
             }
-            Ok(layout::SourcePage { height: img.height(), panels })
+            let rects = panels.iter().map(|p| p.rect).collect();
+            let shapes = panels.into_iter().map(|p| p.shape).collect();
+            Ok((layout::SourcePage { height: img.height(), panels: rects }, shapes))
         })
         .collect::<Result<_>>()?;
     pb.finish_and_clear();
+    let (sources, shapes): (Vec<_>, Vec<_>) = detected.into_iter().unzip();
     let n_panels: usize = sources.iter().map(|s| s.panels.len()).sum();
     println!("Detected {n_panels} panel(s)");
 
@@ -218,7 +227,7 @@ fn run() -> Result<()> {
     let rendered: Vec<Vec<u8>> = out_pages
         .par_iter()
         .progress_with(pb.clone())
-        .map(|p| output::render_page(p, &pages, &ro))
+        .map(|p| output::render_page(p, &pages, &shapes, &ro))
         .collect::<Result<_>>()?;
     pb.finish_and_clear();
 

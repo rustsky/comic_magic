@@ -34,6 +34,8 @@ pub struct LayoutOptions {
 #[derive(Clone, Debug)]
 pub struct Placement {
     pub page: usize,
+    /// Index of the panel within its source page.
+    pub panel: usize,
     pub src: Rect,
     pub x: u32,
     pub y: u32,
@@ -50,6 +52,8 @@ pub struct OutPage {
 
 struct Unit {
     page: usize,
+    /// Panel index of `panels[0]`; a unit always holds consecutive panels.
+    first: usize,
     panels: Vec<Rect>,
     scale: f32,
     rotated: bool,
@@ -77,7 +81,10 @@ pub fn layout(pages: &[SourcePage], o: &LayoutOptions) -> Vec<OutPage> {
     for (pi, sp) in pages.iter().enumerate() {
         // Screen pixels per source pixel needed for readability.
         let target = o.readable_scale * o.print_height_in * o.ppi as f32 / sp.height as f32;
+        let mut first = 0;
         for row in group_rows(&sp.panels) {
+            let row_first = first;
+            first += row.len();
             if row.len() > 1 {
                 let sum_w: f32 = row.iter().map(|p| p.w as f32).sum();
                 let max_h = row.iter().map(|p| p.h as f32).fold(0.0, f32::max);
@@ -86,21 +93,22 @@ pub fn layout(pages: &[SourcePage], o: &LayoutOptions) -> Vec<OutPage> {
                     .min(uh / max_h);
                 // Keep panels side by side when that costs at most 10% of the target size.
                 if s >= target * 0.9 {
-                    units.push(Unit { page: pi, panels: row, scale: s, rotated: false });
+                    units.push(Unit { page: pi, first: row_first, panels: row, scale: s, rotated: false });
                     continue;
                 }
             }
-            for p in row {
+            for (j, p) in row.into_iter().enumerate() {
+                let first = row_first + j;
                 let (w, h) = (p.w as f32, p.h as f32);
                 let s = target.min(uw / w).min(uh / h);
                 if o.rotate && s < target * 0.95 && w > h {
                     let sr = target.min(uw / h).min(uh / w);
                     if sr > s * 1.2 {
-                        units.push(Unit { page: pi, panels: vec![p], scale: sr, rotated: true });
+                        units.push(Unit { page: pi, first, panels: vec![p], scale: sr, rotated: true });
                         continue;
                     }
                 }
-                units.push(Unit { page: pi, panels: vec![p], scale: s, rotated: false });
+                units.push(Unit { page: pi, first, panels: vec![p], scale: s, rotated: false });
             }
         }
     }
@@ -187,6 +195,7 @@ fn place(units: Vec<Unit>, o: &LayoutOptions, uw: f32, uh: f32) -> OutPage {
             let (w, h) = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
             items.push(Placement {
                 page: u.page,
+                panel: u.first + i,
                 src: u.panels[i],
                 x: x.round() as u32,
                 y: (y + (row_h - h as f32) / 2.0).round() as u32,
